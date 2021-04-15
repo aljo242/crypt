@@ -1,200 +1,93 @@
 package main
 
 import (
-	"bufio"
-	"crypto/sha256"
-	"encoding/hex"
-	"encoding/json"
+	"context"
 	"fmt"
-	"io"
-	"log"
-	"net"
-	"os"
-	"strconv"
-	"sync"
 	"time"
 
-	"github.com/davecgh/go-spew/spew"
-	"github.com/joho/godotenv"
+	"github.com/libp2p/go-libp2p"
+	connmgr "github.com/libp2p/go-libp2p-connmgr"
+	"github.com/libp2p/go-libp2p-core/crypto"
+	"github.com/libp2p/go-libp2p-core/host"
+	"github.com/libp2p/go-libp2p-core/peer"
+	routing "github.com/libp2p/go-libp2p-core/routing"
+	dht "github.com/libp2p/go-libp2p-kad-dht"
+	libp2pquic "github.com/libp2p/go-libp2p-quic-transport"
+	secio "github.com/libp2p/go-libp2p-secio"
+	libp2ptls "github.com/libp2p/go-libp2p-tls"
 )
 
-const ()
-
-var ()
-
-// Block is "item" in our blockchain
-type Block struct {
-	Index     uint64
-	Timestamp string
-	BPM       uint64 // instead of this, we can have the block contain the current ledge which is a map of IDs to balances
-	Hash      string
-	PrevHash  string
-}
-
-type BlockChain []Block
-
-var localChain BlockChain
-var serverChain chan BlockChain
-var mutex = &sync.Mutex{}
-
-// perform SHA256 hash of block
-func hashBlock(block Block) (string, error) {
-	input := string(block.Index) + block.Timestamp + string(block.BPM) + block.PrevHash
-	hash := sha256.New()
-	_, err := hash.Write([]byte(input))
-	if err != nil {
-		return "", err
-	}
-
-	hashed := hash.Sum(nil) // TODO ????
-	return hex.EncodeToString(hashed), nil
-}
-
-func generateNewBlock(oldBlock Block, BPM uint64) (Block, error) {
-	var newBlock Block
-
-	t := time.Now()
-
-	newBlock.Index = oldBlock.Index + 1
-	newBlock.Timestamp = t.String()
-	newBlock.BPM = BPM
-	newBlock.PrevHash = oldBlock.Hash
-
-	h, err := hashBlock(newBlock)
-	if err != nil {
-		return newBlock, err
-	}
-
-	newBlock.Hash = h
-
-	return newBlock, nil
-}
-
-// IsBlockValid ensures the old and new blocks have proper indexing, and hashes
-func IsBlockValid(newBlock, oldBlock Block) bool {
-	if newBlock.Index != oldBlock.Index+1 {
-		fmt.Println(1)
-		return false
-	}
-
-	if newBlock.PrevHash != oldBlock.Hash {
-		return false
-	}
-
-	h, err := hashBlock(newBlock)
-	if err != nil {
-		fmt.Println(2)
-		return false
-	}
-
-	if h != newBlock.Hash {
-		fmt.Println(3)
-		fmt.Println(h)
-		fmt.Println(newBlock.Hash)
-		return false
-	}
-
-	return true
-}
-
-// if another chain is longer than our local chain, use that one
-func replaceChain(newChain BlockChain) {
-	if len(newChain) > len(localChain) {
-		localChain = newChain
-	}
-}
-
-func handleConn(conn net.Conn) {
-	defer conn.Close()
-
-	io.WriteString(conn, "Enter a new BPM: ")
-
-	scanner := bufio.NewScanner(conn)
-
-	// take in  BPM from stdin and add it to the blockchain after validating
-	go func() {
-		for scanner.Scan() {
-			bpm, err := strconv.Atoi(scanner.Text())
-			if err != nil {
-				log.Printf("%v not a number: %v", scanner.Text(), err)
-				continue
-			}
-
-			newBlock, err := generateNewBlock(localChain[len(localChain)-1], uint64(bpm))
-			if err != nil {
-				log.Println(err)
-				continue
-			}
-
-			if IsBlockValid(newBlock, localChain[len(localChain)-1]) {
-				newBlockChain := append(localChain, newBlock)
-				replaceChain(newBlockChain)
-			}
-
-			serverChain <- localChain
-			io.WriteString(conn, "\nEnter a new BPM: ")
-		}
-	}()
-
-	go func() {
-		for {
-			time.Sleep(30 * time.Second) // simulate transmission time
-			mutex.Lock()
-			output, err := json.Marshal(localChain)
-			if err != nil {
-				log.Fatal(err)
-			}
-			mutex.Unlock()
-			io.WriteString(conn, string(output))
-		}
-	}()
-
-	for _ = range serverChain {
-		spew.Dump(localChain)
-	}
-}
-
 func main() {
-	err := godotenv.Load()
+	// the context governs the lifetime of the libp2p node
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	// to construct a simple host wiht all the default setings, just use `New`
+	h, err := libp2p.New(ctx)
 	if err != nil {
-		log.Fatal(err) // if we fail to load env, just kill app, since nothing will work anyways
+		panic(err)
 	}
 
-	serverChain = make(chan BlockChain)
+	fmt.Printf("Hello World, my host ID is %s\n", h.ID())
 
-	// create genesis block
-	t := time.Now()
-	genesisBlock := Block{}
-	h, err := hashBlock(genesisBlock)
+	// set your own keypair
+	priv, _, err := crypto.GenerateKeyPair(
+		crypto.Ed25519, // Select key type
+		-1,             // Select key length
+	)
 	if err != nil {
-		log.Fatal(err) // unable to build a genesis block
+		panic(err)
 	}
 
-	genesisBlock = Block{
-		Index:     0,
-		Timestamp: t.String(),
-		BPM:       0,
-		Hash:      h,
-		PrevHash:  "",
-	}
+	var idht *dht.IpfsDHT
 
-	spew.Dump(genesisBlock)
-	localChain = append(localChain, genesisBlock)
+	h2, err := libp2p.New(ctx,
+		// use generated keypair
+		libp2p.Identity(priv),
+		// multiple listen addresses
+		libp2p.ListenAddrStrings(
+			"/ip4/0.0.0.0/tcp/9000",      // regular TCP connection
+			"/ip4/0.0.0.0/udp/9000/quic", // a UDP endpoint for the QUIC transport
+		),
+		// support TLS connections
+		libp2p.Security(libp2ptls.ID, libp2ptls.New),
+		// secio connections
+		libp2p.Security(secio.ID, secio.New),
+		// support QUIC
+		libp2p.Transport(libp2pquic.NewTransport),
+		// support any other default transports (TCP)
+		libp2p.DefaultTransports,
+		// Let's prevent our peer from having too many
+		// connections by attaching a connection manager
+		libp2p.ConnectionManager(connmgr.NewConnManager(
+			100,         // LowWater
+			400,         // HighWater
+			time.Minute, // GracePeriod
+		)),
+		// attempt ot open ports using uPNP for NATed hosts
+		libp2p.NATPortMap(),
+		// let this host use the DHT to find other hosts
+		libp2p.Routing(func(h host.Host) (routing.PeerRouting, error) {
+			idht, err = dht.New(ctx, h)
+			return idht, err
+		}),
+		// Let this host use relay the advertise itself on relays if
+		// it finds it is behind NAT. Use libp2p.Relay(options...) to
+		// enable active relays and more.
+		libp2p.EnableAutoRelay(),
+	)
 
-	// start TCP and serve TCP server
-	server, err := net.Listen("tcp", ":"+os.Getenv("ADDR"))
 	if err != nil {
-		log.Fatal(err)
+		panic(err)
 	}
 
-	defer server.Close()
+	fmt.Printf("Hello World, my configured host ID is %s\n", h2.ID())
 
-	// loop pump accepts a conn, then dispatches a goroutine to handle
-	for {
-		conn, err := server.Accept()
-		if err != nil {
-			log.Fatal(err)
-		}
-		go handleConn(conn)
+	// last step to fully set up is to connect to bootstrap peers
+	for _, addr := range dht.DefaultBootstrapPeers {
+		pi, _ := peer.AddrInfoFromP2pAddr(addr)
+		h2.Connect(ctx, *pi)
+		fmt.Println(*pi)
+
 	}
 }
