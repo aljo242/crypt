@@ -1,200 +1,210 @@
 package main
 
 import (
-	"bufio"
-	"crypto/sha256"
+	"crypto/sha512"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
 	"log"
-	"net"
+	"net/http"
 	"os"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
-	"github.com/davecgh/go-spew/spew"
+	"github.com/gorilla/mux"
 	"github.com/joho/godotenv"
 )
 
-const ()
+const (
+	difficulty = 10
+)
 
-var ()
+var (
+	mutex = &sync.Mutex{}
+)
 
-// Block is "item" in our blockchain
 type Block struct {
-	Index     uint64
-	Timestamp string
-	BPM       uint64 // instead of this, we can have the block contain the current ledge which is a map of IDs to balances
-	Hash      string
-	PrevHash  string
+	Index      uint64
+	Timestamp  string
+	BPM        uint64
+	Hash       string
+	PrevHash   string
+	Difficulty uint64
+	Nonce      string
+}
+
+type Message struct {
+	BPM uint64
 }
 
 type BlockChain []Block
 
 var localChain BlockChain
-var serverChain chan BlockChain
-var mutex = &sync.Mutex{}
 
-// perform SHA256 hash of block
-func hashBlock(block Block) (string, error) {
-	input := string(block.Index) + block.Timestamp + string(block.BPM) + block.PrevHash
-	hash := sha256.New()
-	_, err := hash.Write([]byte(input))
-	if err != nil {
-		return "", err
-	}
-
-	hashed := hash.Sum(nil) // TODO ????
-	return hex.EncodeToString(hashed), nil
+func getHash(block Block) string {
+	input := strconv.Itoa(int(block.Index)) + block.Timestamp + strconv.Itoa(int(block.BPM)) + block.PrevHash + block.Nonce
+	hash := sha512.New()
+	hash.Write([]byte(input))
+	hashed := hash.Sum(nil)
+	return hex.EncodeToString(hashed)
 }
 
-func generateNewBlock(oldBlock Block, BPM uint64) (Block, error) {
+func generateBlock(prevBlock Block, BPM uint64) Block {
 	var newBlock Block
 
 	t := time.Now()
 
-	newBlock.Index = oldBlock.Index + 1
-	newBlock.Timestamp = t.String()
+	newBlock.Index = prevBlock.Index + 1
 	newBlock.BPM = BPM
-	newBlock.PrevHash = oldBlock.Hash
+	newBlock.Timestamp = t.String()
+	newBlock.PrevHash = prevBlock.Hash
+	newBlock.Difficulty = difficulty
 
-	h, err := hashBlock(newBlock)
-	if err != nil {
-		return newBlock, err
+	// PoW
+	start := time.Now()
+	fmt.Println("finding hash with difficulty : ", difficulty)
+	for i := 0; ; i++ {
+		hex := fmt.Sprintf("%x", i)
+		newBlock.Nonce = hex
+		if !IsHashValid(getHash(newBlock), int(newBlock.Difficulty)) {
+			continue
+		} else {
+			fmt.Println(getHash(newBlock), " work done!")
+			elapsed := time.Now().Second() - start.Second()
+			fmt.Printf("Elapsed Time: %vs\n", elapsed)
+
+			newBlock.Hash = getHash(newBlock)
+			break
+		}
 	}
 
-	newBlock.Hash = h
-
-	return newBlock, nil
+	return newBlock
 }
 
-// IsBlockValid ensures the old and new blocks have proper indexing, and hashes
-func IsBlockValid(newBlock, oldBlock Block) bool {
-	if newBlock.Index != oldBlock.Index+1 {
-		fmt.Println(1)
+func IsHashValid(hash string, difficulty int) bool {
+	prefix := strings.Repeat("0", difficulty)
+	return strings.HasPrefix(hash, prefix)
+}
+
+func IsBlockValid(newBlock, prevBlock Block) bool {
+	if prevBlock.Index+1 != newBlock.Index {
 		return false
 	}
 
-	if newBlock.PrevHash != oldBlock.Hash {
+	if prevBlock.Hash != newBlock.PrevHash {
 		return false
 	}
 
-	h, err := hashBlock(newBlock)
-	if err != nil {
-		fmt.Println(2)
-		return false
-	}
-
-	if h != newBlock.Hash {
-		fmt.Println(3)
-		fmt.Println(h)
-		fmt.Println(newBlock.Hash)
+	if getHash(newBlock) != newBlock.Hash {
 		return false
 	}
 
 	return true
 }
 
-// if another chain is longer than our local chain, use that one
-func replaceChain(newChain BlockChain) {
-	if len(newChain) > len(localChain) {
-		localChain = newChain
+func RespondWithJSON(w http.ResponseWriter, r *http.Request, code int, payload interface{}) {
+	w.Header().Set("Content-Type", "application/json")
+	resp, err := json.MarshalIndent(payload, "", " ")
+	if err != nil {
+		w.WriteHeader(http.StatusInternalServerError)
+		w.Write([]byte("HTTP 500: Internal Server Error"))
+	}
+
+	w.WriteHeader(code)
+	w.Write(resp)
+}
+
+func handleGetBlockchain() func(w http.ResponseWriter, r *http.Request) {
+	return func(w http.ResponseWriter, r *http.Request) {
+		bytes, err := json.MarshalIndent(localChain, "", " ")
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+
+		io.WriteString(w, string(bytes))
 	}
 }
 
-func handleConn(conn net.Conn) {
-	defer conn.Close()
+func handleWriteBlockchain() func(w http.ResponseWriter, r *http.Request) {
+	return func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		var m Message
 
-	io.WriteString(conn, "Enter a new BPM: ")
-
-	scanner := bufio.NewScanner(conn)
-
-	// take in  BPM from stdin and add it to the blockchain after validating
-	go func() {
-		for scanner.Scan() {
-			bpm, err := strconv.Atoi(scanner.Text())
-			if err != nil {
-				log.Printf("%v not a number: %v", scanner.Text(), err)
-				continue
-			}
-
-			newBlock, err := generateNewBlock(localChain[len(localChain)-1], uint64(bpm))
-			if err != nil {
-				log.Println(err)
-				continue
-			}
-
-			if IsBlockValid(newBlock, localChain[len(localChain)-1]) {
-				newBlockChain := append(localChain, newBlock)
-				replaceChain(newBlockChain)
-			}
-
-			serverChain <- localChain
-			io.WriteString(conn, "\nEnter a new BPM: ")
+		decoder := json.NewDecoder(r.Body)
+		if err := decoder.Decode(&m); err != nil {
+			RespondWithJSON(w, r, http.StatusBadRequest, r.Body)
+			return
 		}
-	}()
 
-	go func() {
-		for {
-			time.Sleep(30 * time.Second) // simulate transmission time
-			mutex.Lock()
-			output, err := json.Marshal(localChain)
-			if err != nil {
-				log.Fatal(err)
-			}
-			mutex.Unlock()
-			io.WriteString(conn, string(output))
+		defer r.Body.Close()
+
+		// ensure atomicity when creating new block
+		mutex.Lock()
+		newBlock := generateBlock(localChain[len(localChain)-1], m.BPM)
+		mutex.Unlock()
+
+		if IsBlockValid(newBlock, localChain[len(localChain)-1]) {
+			localChain = append(localChain, newBlock)
 		}
-	}()
 
-	for _ = range serverChain {
-		spew.Dump(localChain)
+		RespondWithJSON(w, r, http.StatusCreated, newBlock)
 	}
+}
+
+func makeMuxRouter() http.Handler {
+	mux := mux.NewRouter()
+
+	mux.HandleFunc("/", handleGetBlockchain()).Methods("GET")
+	mux.HandleFunc("/", handleWriteBlockchain()).Methods("POST")
+
+	return mux
+}
+
+func run() error {
+	mux := makeMuxRouter()
+	httpAddr := os.Getenv("PORT")
+	log.Println("Listening on :", httpAddr)
+	s := &http.Server{
+		Addr:           ":" + httpAddr,
+		Handler:        mux,
+		ReadTimeout:    10 * time.Second,
+		WriteTimeout:   10 * time.Second,
+		MaxHeaderBytes: 1 << 20,
+	}
+
+	if err := s.ListenAndServe(); err != nil {
+		return err
+	}
+
+	return nil
 }
 
 func main() {
 	err := godotenv.Load()
 	if err != nil {
-		log.Fatal(err) // if we fail to load env, just kill app, since nothing will work anyways
-	}
-
-	serverChain = make(chan BlockChain)
-
-	// create genesis block
-	t := time.Now()
-	genesisBlock := Block{}
-	h, err := hashBlock(genesisBlock)
-	if err != nil {
-		log.Fatal(err) // unable to build a genesis block
-	}
-
-	genesisBlock = Block{
-		Index:     0,
-		Timestamp: t.String(),
-		BPM:       0,
-		Hash:      h,
-		PrevHash:  "",
-	}
-
-	spew.Dump(genesisBlock)
-	localChain = append(localChain, genesisBlock)
-
-	// start TCP and serve TCP server
-	server, err := net.Listen("tcp", ":"+os.Getenv("ADDR"))
-	if err != nil {
 		log.Fatal(err)
 	}
 
-	defer server.Close()
-
-	// loop pump accepts a conn, then dispatches a goroutine to handle
-	for {
-		conn, err := server.Accept()
-		if err != nil {
-			log.Fatal(err)
+	go func() {
+		t := time.Now()
+		genesisBlock := Block{}
+		genesisBlock = Block{
+			Index:      0,
+			Timestamp:  t.String(),
+			BPM:        0,
+			Hash:       getHash(genesisBlock),
+			PrevHash:   "",
+			Difficulty: difficulty,
 		}
-		go handleConn(conn)
-	}
+
+		mutex.Lock()
+		localChain = append(localChain, genesisBlock)
+		mutex.Unlock()
+	}()
+
+	log.Fatal(run())
 }
